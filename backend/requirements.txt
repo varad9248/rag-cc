@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+psycopg2-binary
+pgvector
+requests
+google-generativeai
+pydantic
+python-dotenv
+pyjwt
+bcrypt
+python-multipart
+celery
+redis
+langchain-text-splitters
+huggingface_hub
+PyPDF2
+PyMuPDF
