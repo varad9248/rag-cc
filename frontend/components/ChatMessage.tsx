@@ -10,10 +10,22 @@ export default function ChatMessage({ msg }: { msg: Message }) {
   const isUser = msg.role === 'user';
   const [activeCite, setActiveCite] = useState<Citation | null>(null);
 
-  // Magic Step: Turn "[1]" into a markdown link "[[1]](#cite-1)" so the parser can hook into it
   const processedContent = isUser 
     ? msg.content 
-    : msg.content.replace(/\[(\d+)\]/g, '[$1](#cite-$1)');
+    : msg.content.replace(/\[([\d,\s]+)\]/g, (match, numbers) => {
+        const links = numbers.split(',').map((n: string) => {
+          const num = n.trim();
+          return `[${num}](#cite-${num})`;
+        });
+        return `[${links.join(', ')}]`;
+      });
+
+  // NEW: Filter citations to ONLY show the ones the AI actually referenced in the text
+  const usedCitations = msg.citations?.filter(cite => {
+    // Looks for the specific citation number anywhere inside brackets in the AI's response
+    const regex = new RegExp(`\\[[^\\]]*\\b${cite.citation_number}\\b[^\\]]*\\]`);
+    return regex.test(msg.content);
+  }) || [];
 
   return (
     <div className={`p-5 rounded-2xl max-w-[85%] shadow-sm transition-all ${
@@ -25,7 +37,7 @@ export default function ChatMessage({ msg }: { msg: Message }) {
       {isUser ? (
         <p className="whitespace-pre-wrap leading-relaxed text-[15px]">{msg.content}</p>
       ) : (
-        // The 'prose' class comes from Tailwind Typography, beautifully formatting headers, lists, and bold text.
+        // The 'prose' class beautifully formats headers, lists, and bold text.
         <div className="prose prose-sm prose-blue max-w-none prose-p:leading-relaxed prose-a:text-blue-600">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
@@ -36,7 +48,7 @@ export default function ChatMessage({ msg }: { msg: Message }) {
                   const citeNum = parseInt(href.replace('#cite-', ''));
                   const citation = msg.citations?.find(c => c.citation_number === citeNum);
                   
-                  if (!citation) return <span className="text-slate-400">[{citeNum}]</span>;
+                  if (!citation) return <span className="text-slate-400">{children}</span>;
 
                   return (
                     <button
@@ -44,7 +56,7 @@ export default function ChatMessage({ msg }: { msg: Message }) {
                       className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 ml-1 mr-0.5 text-[10px] font-bold text-blue-700 bg-blue-100 rounded-md hover:bg-blue-600 hover:text-white transition-colors cursor-pointer no-underline align-middle shadow-sm border border-blue-200"
                       title={`View source: ${citation.source}`}
                     >
-                      {citeNum}
+                      {children}
                     </button>
                   );
                 }
@@ -58,13 +70,13 @@ export default function ChatMessage({ msg }: { msg: Message }) {
         </div>
       )}
 
-      {/* Legacy Footer for sources (Optional, can be kept for quick reference) */}
-      {!isUser && msg.citations && msg.citations.length > 0 && (
+      {/* FIXED: The footer now maps over 'usedCitations' instead of 'msg.citations' */}
+      {!isUser && usedCitations.length > 0 && (
         <div className="mt-6 pt-3 border-t border-slate-100/50 text-xs bg-slate-50/50 p-3 rounded-lg flex flex-wrap gap-2 items-center">
           <strong className="uppercase tracking-wider text-[10px] text-slate-400 mr-2">
-            Sources:
+            Sources Cited:
           </strong>
-          {msg.citations.map(cite => (
+          {usedCitations.map(cite => (
              <span key={cite.citation_number} className="text-slate-500 bg-white border border-slate-200 px-2 py-1 rounded shadow-sm flex items-center gap-1">
                 <span className="font-bold text-blue-600">[{cite.citation_number}]</span>
                 <span className="truncate max-w-[150px]">{cite.source}</span>
@@ -102,7 +114,7 @@ export default function ChatMessage({ msg }: { msg: Message }) {
             </div>
             
             <div className="p-6 overflow-y-auto text-[15px] text-slate-700 leading-relaxed whitespace-pre-wrap bg-white font-serif">
-              {activeCite.content || "Content unavailable. (Is the backend sending it?)"}
+              {activeCite.content || "Content unavailable."}
             </div>
           </div>
         </div>
