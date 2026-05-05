@@ -36,6 +36,18 @@ services:
       - redis
     env_file:
       - .env
+  
+  frontend:
+    build: 
+      context: ./frontend
+      # Pass the API URL to Next.js during the build phase
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
 
 volumes:
   pgdata:
