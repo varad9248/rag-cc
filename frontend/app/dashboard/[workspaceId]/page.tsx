@@ -144,7 +144,7 @@ export default function WorkspacePage() {
     };
 
     try {
-    const res = await fetch('http://localhost:8000/chat/stream', {
+    const res = await fetch(`${API_BASE_URL}/chat/stream`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ workspace_id: workspaceId, query: currentQuery })
