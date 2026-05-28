@@ -15,3 +15,5 @@ langchain-text-splitters
 huggingface_hub
 PyPDF2
 PyMuPDF
+langchain-core
+langchain-google-genai

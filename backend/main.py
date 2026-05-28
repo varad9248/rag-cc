@@ -18,6 +18,10 @@ from utils.auth import create_access_token, get_current_user, get_password_hash,
 from worker import process_document
 from services.embeddings import get_embedding
 
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
 app = FastAPI()
 logger = logging.getLogger(__name__)
 
@@ -243,6 +247,111 @@ def chat_stream(req: QueryRequest, user_id: int = Depends(get_current_user)):
             raise HTTPException(status_code=403, detail="Unauthorized workspace access")
         
         # UPGRADE: Hybrid Search SQL Query with Reciprocal Rank Fusion (RRF)
+        cursor.execute(
+            """
+            WITH vector_search AS (
+                SELECT id, source_name, content,
+                       ROW_NUMBER() OVER (ORDER BY embedding <=> %s::vector) as vector_rank
+                FROM document_chunks
+                WHERE workspace_id = %s
+                ORDER BY embedding <=> %s::vector LIMIT 30
+            ),
+            keyword_search AS (
+                SELECT id, source_name, content,
+                       ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts, websearch_to_tsquery('english', %s)) DESC) as keyword_rank
+                FROM document_chunks
+                WHERE workspace_id = %s AND fts @@ websearch_to_tsquery('english', %s)
+                ORDER BY keyword_rank LIMIT 30
+            )
+            SELECT id, source_name, content,
+                   COALESCE(1.0 / (60 + vector_rank), 0.0) + COALESCE(1.0 / (60 + keyword_rank), 0.0) as rrf_score
+            FROM vector_search
+            FULL OUTER JOIN keyword_search USING (id, source_name, content)
+            ORDER BY rrf_score DESC
+            LIMIT %s;
+            """,
+            (str(query_vector), req.workspace_id, str(query_vector), req.query, req.workspace_id, req.query, RETRIEVAL_TOP_K)
+        )
+        results = cursor.fetchall()
+
+    context_text = ""
+    citations_metadata = []
+    
+    # Format the retrieved chunks for the prompt
+    for idx, row in enumerate(results):
+        chunk_id, source_name, content, _ = row
+        context_text += f"\n--- Source [{idx + 1}]: {source_name} ---\n{content}\n"
+        citations_metadata.append({"citation_number": idx + 1, "source": source_name, "chunk_id": chunk_id , "content": content})
+
+    # 3. Initialize the LangChain Chat Model
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.0,
+        google_api_key=GEMINI_API_KEY
+    )
+
+    # 4. Define a strict LangChain PromptTemplate
+    template = """
+    You are a helpful, factual enterprise AI assistant. You answer questions based ONLY on the provided Context.
+
+    Context Rules:
+    1. The Context contains excerpts from uploaded documents. The name of the document is provided in the source tags.
+    2. If the user asks general questions about entities (like "What is"), you are allowed to logically infer basic information from the context (e.g., "GlobalCorp is the organization that issued the HR Remote Work Policy").
+    3. If the answer cannot be logically deduced from the Context at all, you MUST reply verbatim: "I do not have enough information in the provided documents to answer that."
+    4. When you provide an answer based on the context, append the source number in brackets to the end of the relevant sentence. Example: [1].
+    
+    Context:
+    {context}
+
+    Question: {question}
+    """
+    
+    prompt = PromptTemplate.from_template(template)
+
+    # 5. Build the LangChain Expression Language (LCEL) Chain
+    chain = prompt | llm | StrOutputParser()
+
+    # 6. Stream the output using LangChain's async streaming (.astream)
+    async def stream_generator():
+        if not results:
+            yield f"data: {json.dumps({'type': 'text', 'content': no_answer_message})}\n\n"
+            yield f"data: {json.dumps({'type': 'metadata', 'citations': []})}\n\n"
+            return
+            
+        try:
+            # LangChain natively supports async token streaming
+            async for chunk_text in chain.astream({
+                "context": context_text, 
+                "question": req.query
+            }):
+                if chunk_text:
+                    yield f"data: {json.dumps({'type': 'text', 'content': chunk_text})}\n\n"
+                    
+        except Exception:
+            logger.exception("LangChain model streaming failed for workspace_id=%s", req.workspace_id)
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Failed to generate response from model.'})}\n\n"
+        finally:
+            # Yield your citations metadata at the end of the stream
+            yield f"data: {json.dumps({'type': 'metadata', 'citations': citations_metadata})}\n\n"
+
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+    no_answer_message = "I do not have enough information in the provided documents to answer that."
+    
+    # 1. Rewrite the query for better retrieval
+    optimized_query = rewrite_query_for_search(req.query)
+
+    try:
+        # 2. Get embedding of the optimized query
+        query_vector = get_embedding(optimized_query)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    with get_db_cursor() as (_, cursor):
+        cursor.execute("SELECT id FROM workspaces WHERE id = %s AND user_id = %s", (req.workspace_id, user_id))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=403, detail="Unauthorized workspace access")
+        
+        # UPGRADE: Hybrid Search SQL Query with Reciprocal Rank Fusion (RRF)
         # It searches both the vector space (embedding) and the full-text space (fts)
         cursor.execute(
             """
@@ -280,7 +389,17 @@ def chat_stream(req: QueryRequest, user_id: int = Depends(get_current_user)):
         context_text += f"\n--- Source [{idx + 1}]: {source_name} ---\n{content}\n"
         citations_metadata.append({"citation_number": idx + 1, "source": source_name, "chunk_id": chunk_id , "content": content})
 
-    prompt = f"""
+    # ... (Your existing RRF SQL Query and context_text building stays exactly the same) ...
+
+    # 1. Initialize the LangChain Chat Model
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.0,
+        google_api_key=GEMINI_API_KEY
+    )
+
+    # 2. Define a strict LangChain PromptTemplate
+    template = """
     You are a helpful, factual enterprise AI assistant. You answer questions based ONLY on the provided Context.
 
     Context Rules:
@@ -290,34 +409,38 @@ def chat_stream(req: QueryRequest, user_id: int = Depends(get_current_user)):
     4. When you provide an answer based on the context, append the source number in brackets to the end of the relevant sentence. Example: [1].
     
     Context:
-    {context_text}
+    {context}
 
-    Question: {req.query}
+    Question: {question}
     """
+    
+    prompt = PromptTemplate.from_template(template)
 
+    # 3. Build the LangChain Expression Language (LCEL) Chain
+    # This pipes the prompt into the LLM, and outputs a clean string.
+    chain = prompt | llm | StrOutputParser()
+
+    # 4. Stream the output using LangChain's async streaming (.astream)
     async def stream_generator():
         if not results:
             yield f"data: {json.dumps({'type': 'text', 'content': no_answer_message})}\n\n"
             yield f"data: {json.dumps({'type': 'metadata', 'citations': []})}\n\n"
             return
+            
         try:
-            response = model.generate_content(
-                prompt, 
-                stream=True,
-                generation_config=genai.types.GenerationConfig(temperature=0.3)
-            )
-            has_text = False
-            for chunk in response:
-                chunk_text = getattr(chunk, "text", "")
+            # LangChain natively supports async token streaming
+            async for chunk_text in chain.astream({
+                "context": context_text, 
+                "question": req.query
+            }):
                 if chunk_text:
-                    has_text = True
                     yield f"data: {json.dumps({'type': 'text', 'content': chunk_text})}\n\n"
-            if not has_text:
-                yield f"data: {json.dumps({'type': 'text', 'content': no_answer_message})}\n\n"
+                    
         except Exception:
-            logger.exception("Model streaming failed for workspace_id=%s", req.workspace_id)
+            logger.exception("LangChain model streaming failed for workspace_id=%s", req.workspace_id)
             yield f"data: {json.dumps({'type': 'error', 'content': 'Failed to generate response from model.'})}\n\n"
         finally:
+            # Yield your citations metadata at the end of the stream
             yield f"data: {json.dumps({'type': 'metadata', 'citations': citations_metadata})}\n\n"
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
